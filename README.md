@@ -1,5 +1,7 @@
-# CURIO 自動調校
 <div align="center">
+  
+# CURIO 自動調校
+
 <img width="408" height="544" alt="1782612737606" src="https://github.com/user-attachments/assets/4712454a-c32c-4c94-8fcd-758efeda8ae9" />
 </p>
 <div align="left">
