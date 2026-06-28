@@ -1,4 +1,4 @@
-# CURIO 自動調校韌體介紹：L1 vs L2 演算法比較與四版本總覽
+# CURIO 自動調校
 <div align="center">
 <img width="408" height="544" alt="1782612737606" src="https://github.com/user-attachments/assets/4712454a-c32c-4c94-8fcd-758efeda8ae9" />
 </p>
