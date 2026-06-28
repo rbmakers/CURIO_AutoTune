@@ -1,9 +1,8 @@
 # CURIO 自動調校韌體介紹：L1 vs L2 演算法比較與四版本總覽
-
-> 本文件涵蓋四份程式版本：
-> `CURIO_L1_Angle_AutoTune.ino`、`CURIO_L1_Dual_AutoTune.ino`、
-> `CURIO_L2_Angle_AutoTune.ino`、`CURIO_L2_Dual_AutoTune.ino`
-
+<div align="center">
+<img width="408" height="544" alt="1782612737606" src="https://github.com/user-attachments/assets/4712454a-c32c-4c94-8fcd-758efeda8ae9" />
+</p>
+<div align="left">
 ## 0. 總覽：2×2 版本矩陣
 
 四份程式可以用兩個正交的維度來理解：「調校演算法世代」(L1/L2) 與「控制架構」(Angle單環/Dual雙環串級)。
@@ -185,3 +184,4 @@ Td = Pu / 6.5            (≈ 0.1538 · Pu)
 - L1 與 L2 的核心差異是**調校規則**(ZN No-Overshoot vs Tyreus-Luyben)，不是架構；四份程式剛好把「規則世代 × 架構」兩個維度交叉組合成完整矩陣，方便互相比較。
 - 雙環架構(Dual)的繼電器測試對象與套用對象之間仍有理論上的不一致(測角度、套用到角速度內環增益)，這是未來若要進一步提升調校精確度時，最值得優先處理的項目。
 - 目前四份程式在解鎖保護、陀螺儀單位、感測器函式呼叫上已經一致且正確；唯一尚待您決定是否補上的是 `L2_Dual` 中止調校時的內環積分項歸零(`L1_Dual` 已有、`L2_Dual` 目前沒有)。
+</p>  
