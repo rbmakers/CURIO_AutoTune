@@ -1,6 +1,6 @@
 # CURIO 自動調校韌體介紹：L1 vs L2 演算法比較與四版本總覽
 
-> 本文件涵蓋四份程式目前最終(已修正)版本：
+> 本文件涵蓋四份程式版本：
 > `CURIO_L1_Angle_AutoTune.ino`、`CURIO_L1_Dual_AutoTune.ino`、
 > `CURIO_L2_Angle_AutoTune.ino`、`CURIO_L2_Dual_AutoTune.ino`
 
