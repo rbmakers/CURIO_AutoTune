@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <EEPROM.h>   // Flash 模擬 EEPROM，用於保存自動調校結果
+#include <string.h>   // memset()
 #include "BMI088.h"
 
 // ==========================================
@@ -21,6 +23,12 @@ const int I2C0_SDA = 20;
 const int I2C0_SCL = 25;
 #define BMI088_ACC_ADDR  0x18 
 #define BMI088_GYRO_ADDR 0x69
+
+// ELRS / CRSF 接收機（CURIO UART1，與 CURIO_Motor_Rig_Test.ino / CURIO_ELRS_Test.ino 共用同一組接腳/鮑率）
+#define ELRS_SERIAL     Serial2
+#define ELRS_BAUD       420000
+#define PIN_ELRS_TX     4   // CURIO TX1 = GPIO4
+#define PIN_ELRS_RX     5   // CURIO RX1 = GPIO5
 
 // PWM 參數
 const int PWM_FREQ = 20000;   // 20kHz 避免尖叫聲
@@ -62,6 +70,105 @@ float err_prev_roll = 0,  int_roll = 0;
 float err_prev_pitch = 0, int_pitch = 0;
 unsigned long last_pid_time = 0;
 bool is_armed = false;
+
+// ==========================================
+// 💾 PID 調校結果 Flash 持久化（重開機自動讀取上次調校結果）
+// ==========================================
+// 使用 earlephilhower arduino-pico core 的 EEPROM.h（以一塊 Flash 區塊模擬 EEPROM：
+// EEPROM.begin() 載入快取，EEPROM.put()/get() 只動快取，EEPROM.commit() 才真正寫入 Flash）。
+//
+// 安全設計（三層防呆，避免把「看起來合法但實際荒謬」的數值直接套到會讓馬達轉動的 PID 上）：
+//   1. magic + version：判斷這塊 Flash 是否曾經被「這支程式」寫入過合法資料。
+//      不同的 AutoTune 程式使用不同的 magic 值，避免誤讀到別支程式留下的資料。
+//   2. CRC32：偵測位元翻轉或寫入中斷造成的資料毀損。
+//   3. 數值範圍檢查 (gainsSane)：即使 CRC 通過，仍擋掉超出合理範圍或非有限數 (NaN/Inf) 的增益。
+//   任何一層沒通過，就完全放棄載入，維持使用程式內建的預設值。
+#define FLASH_MAGIC   0x4C324132UL  // 本檔案 (L2_Angle) 專屬辨識碼，避免跨檔案誤讀
+#define FLASH_VERSION 1
+const int EEPROM_SIZE = 256; // 遠大於實際結構體所需，保留未來欄位擴充空間
+
+struct PIDFlashData {
+    uint32_t magic;
+    uint32_t version;
+    float p_roll, i_roll, d_roll;
+    float p_pitch, i_pitch, d_pitch;
+    uint32_t crc;
+};
+
+// 數值合理性邊界：依目前預設值 (Kp~1.2, Ki~0.05, Kd~0.15) 留了寬鬆但有限的安全餘裕
+const float GAIN_SANITY_MAX_P = 20.0f;
+const float GAIN_SANITY_MAX_I = 5.0f;
+const float GAIN_SANITY_MAX_D = 5.0f;
+
+// 簡易 CRC32（IEEE 802.3 反向多項式 0xEDB88320，逐位元計算不需查表）。
+// 呼叫頻率極低（開機一次 + 每次調校完成一次），效能完全無關緊要。
+uint32_t crc32_simple(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFUL;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : (crc >> 1);
+        }
+    }
+    return ~crc;
+}
+
+bool gainsSane(float p_roll, float i_roll, float d_roll,
+               float p_pitch, float i_pitch, float d_pitch) {
+    if (!isfinite(p_roll) || !isfinite(i_roll) || !isfinite(d_roll))   return false;
+    if (!isfinite(p_pitch) || !isfinite(i_pitch) || !isfinite(d_pitch)) return false;
+    if (p_roll  < 0 || p_roll  > GAIN_SANITY_MAX_P) return false;
+    if (i_roll  < 0 || i_roll  > GAIN_SANITY_MAX_I) return false;
+    if (d_roll  < 0 || d_roll  > GAIN_SANITY_MAX_D) return false;
+    if (p_pitch < 0 || p_pitch > GAIN_SANITY_MAX_P) return false;
+    if (i_pitch < 0 || i_pitch > GAIN_SANITY_MAX_I) return false;
+    if (d_pitch < 0 || d_pitch > GAIN_SANITY_MAX_D) return false;
+    return true;
+}
+
+// 將目前的 PID 增益（不分是否剛調校過）整份寫入 Flash。
+// 在「任一軸」調校完成時都會呼叫一次，所以即使只單獨調校 Roll，也會把當下
+// 的 Pitch 數值（可能是上次存檔值或內建預設值）一併存下，整份資料維持完整一致。
+void saveGainsToFlash() {
+    PIDFlashData d;
+    d.magic = FLASH_MAGIC;
+    d.version = FLASH_VERSION;
+    d.p_roll = pid_p_roll;  d.i_roll = pid_i_roll;  d.d_roll = pid_d_roll;
+    d.p_pitch = pid_p_pitch; d.i_pitch = pid_i_pitch; d.d_pitch = pid_d_pitch;
+    d.crc = crc32_simple((const uint8_t*)&d, sizeof(d) - sizeof(d.crc));
+
+    EEPROM.put(0, d);
+    EEPROM.commit();
+    Serial.println("💾 調校結果已寫入 Flash，下次開機將自動套用。");
+}
+
+// 開機時讀取，三層檢查皆通過才覆寫程式內建的預設增益；任何一層失敗都直接放棄，
+// 維持使用程式碼裡寫的預設值（並回傳 false 讓 setup() 印出對應訊息）。
+bool loadGainsFromFlash() {
+    PIDFlashData d;
+    EEPROM.get(0, d);
+
+    if (d.magic != FLASH_MAGIC || d.version != FLASH_VERSION) return false;
+
+    uint32_t calc_crc = crc32_simple((const uint8_t*)&d, sizeof(d) - sizeof(d.crc));
+    if (calc_crc != d.crc) return false;
+
+    if (!gainsSane(d.p_roll, d.i_roll, d.d_roll, d.p_pitch, d.i_pitch, d.d_pitch)) return false;
+
+    pid_p_roll = d.p_roll;   pid_i_roll = d.i_roll;   pid_d_roll = d.d_roll;
+    pid_p_pitch = d.p_pitch; pid_i_pitch = d.i_pitch; pid_d_pitch = d.d_pitch;
+    return true;
+}
+
+// 清除 Flash 中已存的調校資料（寫入全零，magic 失效），下次開機會改用程式內建預設值。
+// 本次開機後若不重啟，目前運行中的增益數值不會被回復，僅清除「下次開機」會載入的資料。
+void clearFlashGains() {
+    PIDFlashData d;
+    memset(&d, 0, sizeof(d));
+    EEPROM.put(0, d);
+    EEPROM.commit();
+    Serial.println("🗑️ 已清除 Flash 中的調校資料，下次開機將改用程式內建預設值。");
+}
 
 // ==========================================
 // 🎛️ PID 自動調校與規則定義
@@ -107,6 +214,125 @@ struct RelayTuneState {
 };
 RelayTuneState rt_roll;
 RelayTuneState rt_pitch;
+
+// ==========================================
+// 🎮 ELRS / CRSF 遙控與 ARM 安全機制（移植自 CURIO_ELRS_Test.ino / CURIO_Motor_Rig_Test.ino）
+// ==========================================
+/*
+ * 操作流程：
+ *   1. 通電 → 與 TX16S 完成 ELRS BIND，CH5 應為低位 → DISARMED（馬達禁止轉動）。
+ *   2. 操作者把 CH5 開關撥到高位 → 進入 ARMING，倒數 ARM_HOLD_MS 確認時間。
+ *   3. 倒數滿時仍維持高位 → ARMED：is_armed=true，進入正常單環 PID 水平控制
+ *      （此時才能再用序列指令 't'/'r'/'p' 觸發繼電器自動調校）。
+ *   4. 任何時候 CH5 回到低位、或 ELRS 訊號中斷 ≥ CRSF_LINK_TIMEOUT_MS：
+ *      立即視為安全中斷，無論目前是否在調校中，直接中止並安全斷電。
+ *   5. 若 is_armed 因「其他原因」(傾角防護等) 被強制關閉，但 CH5 仍停在高位，
+ *      要求操作者重新扳動開關才能再次 ARM，避免安全機制剛跳脫就被同一個
+ *      仍停在高位的開關立即覆蓋回去。
+ *
+ * 沒有連接 ELRS 接收機時（例如純桌面測試），序列指令 'g'/'G' 提供手動 ARM 的後備方案。
+ */
+#define CRSF_SYNC_BYTE     0xC8
+#define CRSF_TYPE_RC_CHAN  0x16
+#define CRSF_MAX_FRAME_LEN 64
+
+static uint8_t  crsfBuf[CRSF_MAX_FRAME_LEN];
+static uint8_t  crsfBufIdx  = 0;
+static uint8_t  crsfExpLen  = 0;
+static bool     crsfInFrame = false;
+
+static unsigned long channels[16];
+static uint32_t frameCount    = 0;
+static uint32_t crcErrorCount = 0;
+static uint32_t lastFrameMs   = 0;
+
+const int CH5_INDEX = 4; // channels[] 為 0-indexed，CH5（Arm 開關）對應 index 4
+
+const unsigned long CRSF_LINK_TIMEOUT_MS    = 500;  // 超過此時間沒收到新 CRSF 訊框，視為斷線
+const unsigned long CH5_ARM_THRESHOLD_US    = 1700; // 高於此值視為「開關切高」(意圖 ARM)
+const unsigned long CH5_DISARM_THRESHOLD_US = 1300; // 低於此值視為「開關切低」(DISARM)
+const unsigned long ARM_HOLD_MS = 1500;             // 切高後需維持的確認時間
+
+enum ArmState { ARM_DISARMED, ARM_ARMING, ARM_ARMED };
+ArmState arm_state = ARM_DISARMED;
+unsigned long arming_start_ms = 0;
+bool ch5_require_cycle = false; // true 時即使 CH5 高位也不允許進入 ARMING，須先看到一次低位才解除
+
+static uint8_t crsfCrc8(const uint8_t *data, uint8_t len) {
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? (crc << 1) ^ 0xD5 : (crc << 1);
+        }
+    }
+    return crc;
+}
+
+static inline unsigned long crsfToUs(uint16_t raw) {
+    return (unsigned long)constrain((long)raw * 1000L / 1639L + 895L, 1000L, 2000L);
+}
+
+static void crsfDecodeChannels(const uint8_t *p) {
+    uint16_t ch[16];
+    ch[0]  = ((uint16_t)(p[0])       | (uint16_t)(p[1])  << 8) & 0x07FF;
+    ch[1]  = ((uint16_t)(p[1])  >> 3 | (uint16_t)(p[2])  << 5) & 0x07FF;
+    ch[2]  = ((uint16_t)(p[2])  >> 6 | (uint16_t)(p[3])  << 2 | (uint16_t)(p[4]) << 10) & 0x07FF;
+    ch[3]  = ((uint16_t)(p[4])  >> 1 | (uint16_t)(p[5])  << 7) & 0x07FF;
+    ch[4]  = ((uint16_t)(p[5])  >> 4 | (uint16_t)(p[6])  << 4) & 0x07FF;
+    ch[5]  = ((uint16_t)(p[6])  >> 7 | (uint16_t)(p[7])  << 1 | (uint16_t)(p[8]) << 9) & 0x07FF;
+    ch[6]  = ((uint16_t)(p[8])  >> 2 | (uint16_t)(p[9])  << 6) & 0x07FF;
+    ch[7]  = ((uint16_t)(p[9])  >> 5 | (uint16_t)(p[10]) << 3) & 0x07FF;
+    ch[8]  = ((uint16_t)(p[11])      | (uint16_t)(p[12]) << 8) & 0x07FF;
+    ch[9]  = ((uint16_t)(p[12]) >> 3 | (uint16_t)(p[13]) << 5) & 0x07FF;
+    ch[10] = ((uint16_t)(p[13]) >> 6 | (uint16_t)(p[14]) << 2 | (uint16_t)(p[15]) << 10) & 0x07FF;
+    ch[11] = ((uint16_t)(p[15]) >> 1 | (uint16_t)(p[16]) << 7) & 0x07FF;
+    ch[12] = ((uint16_t)(p[16]) >> 4 | (uint16_t)(p[17]) << 4) & 0x07FF;
+    ch[13] = ((uint16_t)(p[17]) >> 7 | (uint16_t)(p[18]) << 1 | (uint16_t)(p[19]) << 9) & 0x07FF;
+    ch[14] = ((uint16_t)(p[19]) >> 2 | (uint16_t)(p[20]) << 6) & 0x07FF;
+    ch[15] = ((uint16_t)(p[20]) >> 5 | (uint16_t)(p[21]) << 3) & 0x07FF;
+
+    for (int i = 0; i < 16; i++) {
+        channels[i] = crsfToUs(ch[i]);
+    }
+    frameCount++;
+    lastFrameMs = millis();
+}
+
+// 持續排空 UART RX 緩衝區、組訊框、驗證 CRC、解碼——必須每次 loop() 都呼叫，
+// 不可被 2ms 的 PID 控制節拍卡住，否則硬體 UART 緩衝區會在下一個訊框抵達前溢位。
+void parseCRSF() {
+    while (ELRS_SERIAL.available()) {
+        uint8_t byte = ELRS_SERIAL.read();
+        if (!crsfInFrame) {
+            if (byte == CRSF_SYNC_BYTE) {
+                crsfInFrame = true;
+                crsfBufIdx  = 0;
+                crsfBuf[crsfBufIdx++] = byte;
+            }
+        } else {
+            crsfBuf[crsfBufIdx++] = byte;
+            if (crsfBufIdx == 2) {
+                crsfExpLen = byte + 2;
+                if (crsfExpLen > CRSF_MAX_FRAME_LEN) {
+                    crsfInFrame = false;
+                }
+            }
+            if (crsfInFrame && crsfExpLen > 0 && crsfBufIdx >= crsfExpLen) {
+                uint8_t rxCrc  = crsfBuf[crsfExpLen - 1];
+                uint8_t calCrc = crsfCrc8(&crsfBuf[2], crsfExpLen - 3);
+                if (rxCrc == calCrc) {
+                    if (crsfBuf[2] == CRSF_TYPE_RC_CHAN) {
+                        crsfDecodeChannels(&crsfBuf[3]);
+                    }
+                } else {
+                    crcErrorCount++;
+                }
+                crsfInFrame = false;
+            }
+        }
+    }
+}
 
 // ==========================================
 // 🕒 核心功能函數
@@ -319,11 +545,74 @@ void abortAutotune(const char* reason) {
     int_pitch = 0; err_prev_pitch = 0;
 }
 
+// ARM 安全狀態機：每次 loop() 都呼叫一次，獨立於 2ms PID 節拍之外，
+// 確保 DISARM／斷線中斷的反應不會被控制節拍延遲。
+void updateArmState() {
+    bool linked   = (millis() - lastFrameMs < CRSF_LINK_TIMEOUT_MS);
+    bool ch5_high = linked && (channels[CH5_INDEX] > CH5_ARM_THRESHOLD_US);
+    bool ch5_low  = (!linked) || (channels[CH5_INDEX] < CH5_DISARM_THRESHOLD_US);
+
+    if (ch5_low) ch5_require_cycle = false;
+
+    switch (arm_state) {
+        case ARM_DISARMED:
+            if (ch5_high && !ch5_require_cycle) {
+                arm_state = ARM_ARMING;
+                arming_start_ms = millis();
+                Serial.println("🔶 [ARM] CH5 切高，進入 ARMING 確認倒數...");
+            }
+            break;
+
+        case ARM_ARMING:
+            if (ch5_low) {
+                arm_state = ARM_DISARMED;
+                Serial.println("⚪ [ARM] CH5 提前放手，取消 ARMING。");
+            } else if (millis() - arming_start_ms >= ARM_HOLD_MS) {
+                arm_state = ARM_ARMED;
+                is_armed = true;
+                digitalWrite(LED_A, HIGH);
+                Serial.println("🟢 [ARM] 確認時間已滿，ARMED！");
+            }
+            break;
+
+        case ARM_ARMED:
+            if (ch5_low) {
+                arm_state = ARM_DISARMED;
+                if (current_mode != MODE_NORMAL) abortAutotune("CH5 回到 DISARM（或 ELRS 訊號中斷）");
+                is_armed = false;
+                digitalWrite(LED_A, LOW);
+                Serial.println("⛔ [ARM] CH5 回到 DISARM（或 ELRS 訊號中斷），已安全斷電。");
+            } else if (!is_armed) {
+                arm_state = ARM_DISARMED;
+                ch5_require_cycle = true;
+                Serial.println("ℹ️ [ARM] 偵測到非 CH5 觸發的斷電，請將 CH5 切回低再切高以重新 ARM。");
+            }
+            break;
+    }
+}
+
 // ==========================================
 // 🚀 Arduino 核心 Setup & Loop
 // ==========================================
 void setup() {
     Serial.begin(115200);
+
+    // 讀取 Flash 中已存的調校結果（三層防呆驗證皆通過才覆寫內建預設值）
+    EEPROM.begin(EEPROM_SIZE);
+    if (loadGainsFromFlash()) {
+        Serial.println("✅ 已從 Flash 讀取上次調校結果：");
+        Serial.print("   Roll  Kp/Ki/Kd = "); Serial.print(pid_p_roll, 4); Serial.print(" / ");
+        Serial.print(pid_i_roll, 4); Serial.print(" / "); Serial.println(pid_d_roll, 4);
+        Serial.print("   Pitch Kp/Ki/Kd = "); Serial.print(pid_p_pitch, 4); Serial.print(" / ");
+        Serial.print(pid_i_pitch, 4); Serial.print(" / "); Serial.println(pid_d_pitch, 4);
+    } else {
+        Serial.println("ℹ️ 未偵測到有效的 Flash 調校資料，使用程式內建預設值。");
+    }
+
+    // 初始化 ELRS / CRSF 接收機
+    ELRS_SERIAL.setTX(PIN_ELRS_TX);
+    ELRS_SERIAL.setRX(PIN_ELRS_RX);
+    ELRS_SERIAL.begin(ELRS_BAUD);
     
     pinMode(M1_PIN, OUTPUT); pinMode(M2_PIN, OUTPUT);
     pinMode(M3_PIN, OUTPUT); pinMode(M4_PIN, OUTPUT);
@@ -357,30 +646,54 @@ void setup() {
 
     Serial.println("==========================================");
     Serial.println(" PID 自動調校 (繼電器回授法) 指令說明");
-    Serial.println("   t = 全自動調校 (Roll -> Pitch)");
-    Serial.println("   r = 僅調校 Roll 軸");
-    Serial.println("   p = 僅調校 Pitch 軸");
-    Serial.println("   x = 緊急中止調校 (隨時可用)");
+    Serial.println("   [ARM]  TX16S CH5 開關切高並維持 1.5 秒 -> ARMED");
+    Serial.println("   g = 手動 ARM（僅在未偵測到 ELRS 連線時可用，供單機測試）");
+    Serial.println("   s = 手動斷電（任何時候皆可用，等同 ELRS DISARM）");
+    Serial.println("   t = 全自動調校 (Roll -> Pitch)，需先 ARM");
+    Serial.println("   r = 僅調校 Roll 軸，需先 ARM");
+    Serial.println("   p = 僅調校 Pitch 軸，需先 ARM");
+    Serial.println("   x = 取消目前調校 (不會 DISARM，隨時可用)");
+    Serial.println("   c = 清除 Flash 中已存的調校資料 (下次開機改用內建預設值)");
     Serial.println("==========================================");
     
     lastUpdate = micros();
     last_pid_time = millis();
-    is_armed = true; // 校正完成後直接解鎖進入固定平衡測試
-    digitalWrite(LED_A, HIGH);
+    // 注意：不再於校正完成後自動解鎖。ARM 權責交給 TX16S CH5 開關
+    // （或未連接 ELRS 時的手動 'g' 指令），確保馬達在被刻意 ARM 之前絕不轉動。
 }
 
 void loop() {
     // 0. 讀取序列指令
     if (Serial.available() > 0) {
         char cmd = Serial.read();
+        bool elrs_linked = (millis() - lastFrameMs < CRSF_LINK_TIMEOUT_MS);
+
         if (cmd == 'x' || cmd == 'X') {
-            abortAutotune("使用者手動中止");
+            abortAutotune("使用者手動中止"); // 僅取消調校，不會 DISARM
+        } else if (cmd == 's' || cmd == 'S') {
+            abortAutotune("使用者手動斷電");
+            is_armed = false;
+            digitalWrite(LED_A, LOW);
+        } else if ((cmd == 'g' || cmd == 'G') && !is_armed) {
+            if (elrs_linked) {
+                Serial.println("⚠️ 已偵測到 ELRS 連線，請使用 TX16S CH5 開關進行 ARM。");
+            } else {
+                is_armed = true;
+                digitalWrite(LED_A, HIGH);
+                Serial.println("🟢 已手動 ARM（無 ELRS 連線之單機測試模式）。");
+            }
+        } else if (cmd == 'c' || cmd == 'C') {
+            clearFlashGains();
         } else if (current_mode == MODE_NORMAL && is_armed) {
             if (cmd == 't' || cmd == 'T') startAutotuneSequence();
             else if (cmd == 'r' || cmd == 'R') startAutotuneRollOnly();
             else if (cmd == 'p' || cmd == 'P') startAutotunePitchOnly();
         }
     }
+
+    // 0.5 ELRS/CRSF 遙控訊框解析與 ARM 安全狀態機（不受 2ms 控制節拍節流，即時反應）
+    parseCRSF();
+    updateArmState();
 
     // 1. 讀取感測器數據
     bmi088.getAcceleration(&ax, &ay, &az);
@@ -441,6 +754,7 @@ void loop() {
 
                 if (rt_roll.done) {
                     finalizeAxisTuning(rt_roll, "ROLL", pid_p_roll, pid_i_roll, pid_d_roll);
+                    saveGainsToFlash();
                     int_roll = 0; err_prev_roll = 0;
                     if (autotune_chain_to_pitch) {
                         Serial.println("➡️  接續進行 Pitch 軸繼電器測試...");
@@ -467,6 +781,7 @@ void loop() {
 
                 if (rt_pitch.done) {
                     finalizeAxisTuning(rt_pitch, "PITCH", pid_p_pitch, pid_i_pitch, pid_d_pitch);
+                    saveGainsToFlash();
                     int_pitch = 0; err_prev_pitch = 0;
                     Serial.println("🎉 自動調校流程結束，新增益已套用於目前運行中。");
                     current_mode = MODE_NORMAL;
@@ -534,6 +849,9 @@ void loop() {
             Serial.print(rt_pitch.valid_cycles);
             Serial.print("/"); Serial.print(AUTOTUNE_AVG_CYCLES);
         }
+        Serial.print(",Link:"); Serial.print((millis() - lastFrameMs < CRSF_LINK_TIMEOUT_MS) ? "OK" : "--");
+        Serial.print(",CH5:"); Serial.print(channels[CH5_INDEX]);
+        Serial.print(",Arm:"); Serial.print(is_armed ? "ARMED" : (arm_state == ARM_ARMING ? "ARMING" : "DISARMED"));
         Serial.println();
     }
 }
