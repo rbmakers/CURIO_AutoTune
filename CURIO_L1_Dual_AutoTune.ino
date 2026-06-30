@@ -247,6 +247,11 @@ struct RelayTuneState {
 RelayTuneState rt_roll;
 RelayTuneState rt_pitch;
 
+// --- Manual Function Prototypes to fix Arduino Builder Quirk ---
+void resetRelayState(RelayTuneState &rt, float current_angle);
+float relayStep(RelayTuneState &rt, float measured_angle, float target_angle, unsigned long now_ms);
+void finalizeAxisTuning(RelayTuneState &rt, const char* axis_name, float &out_p, float &out_i, float &out_d);
+
 // ==========================================
 // 🎮 ELRS / CRSF 遙控與 ARM 安全機制（移植自 CURIO_ELRS_Test.ino / CURIO_Motor_Rig_Test.ino）
 // ==========================================
